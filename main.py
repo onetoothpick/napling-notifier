@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""
+Discord notifier for one Bluesky account and one YouTube channel.
+
+- Bluesky: new top-level posts only (no replies, reposts, or quote posts)
+- YouTube: new uploads, scheduled streams (optional), streams going live, and
+  reschedules and cancellations of announced streams
+- Pings an optional role per source via a plain Discord webhook
+
+Each source is enabled only if its env vars are set. See .env.example.
+"""
+import logging
+import os
+import random
+import signal
+import sqlite3
+import sys
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import httpx
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
+
+BSKY_ACTOR = os.environ.get("BSKY_ACTOR")  # handle or DID
+BSKY_ROLE_ID = os.environ.get("BSKY_ROLE_ID") or None
+BSKY_POLL = int(os.environ.get("BSKY_POLL_SECONDS") or "60")
+
+YT_KEY = os.environ.get("YOUTUBE_API_KEY")
+YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID")  # starts with UC
+YT_ROLE_ID = os.environ.get("YT_ROLE_ID") or None
+YT_POLL = int(os.environ.get("YT_POLL_SECONDS") or "120")
+YT_NOTIFY_SCHEDULED = os.environ.get("YT_NOTIFY_SCHEDULED", "false").lower() in ("1", "true", "yes")
+# Reschedules smaller than this edit the original message quietly; larger ones
+# also post a new (pinging) message.
+YT_RESCHEDULE_THRESHOLD = int(os.environ.get("YT_RESCHEDULE_THRESHOLD_MINUTES") or "60") * 60
+
+DB_PATH = os.environ.get("DB_PATH", "state.db")
+
+BSKY_API = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+YT_API = "https://www.googleapis.com/youtube/v3"
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("notifier")
+
+http = httpx.Client(timeout=20, headers={"User-Agent": "discord-notifier/1.0"})
+
+# --------------------------------------------------------------------------
+# State (SQLite, shared across threads behind a lock)
+# --------------------------------------------------------------------------
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+_lock = threading.Lock()
+with _lock:
+    _db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS seen (
+            source TEXT NOT NULL, item_id TEXT NOT NULL,
+            PRIMARY KEY (source, item_id));
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS yt_tracked (
+            video_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+            scheduled_at TEXT, pending_at TEXT, message_id TEXT,
+            title TEXT, missing_polls INTEGER DEFAULT 0);
+        """
+    )
+    # Upgrade databases created by earlier versions of this script
+    _cols = {r[1] for r in _db.execute("PRAGMA table_info(yt_tracked)")}
+    for _col, _type in (
+        ("scheduled_at", "TEXT"),
+        ("pending_at", "TEXT"),
+        ("message_id", "TEXT"),
+        ("title", "TEXT"),
+        ("missing_polls", "INTEGER DEFAULT 0"),
+    ):
+        if _col not in _cols:
+            _db.execute(f"ALTER TABLE yt_tracked ADD COLUMN {_col} {_type}")
+    _db.commit()
+
+
+def db(sql, args=()):
+    with _lock:
+        cur = _db.execute(sql, args)
+        rows = cur.fetchall()
+        _db.commit()
+        return rows
+
+
+def is_seen(source, item_id):
+    return bool(db("SELECT 1 FROM seen WHERE source=? AND item_id=?", (source, item_id)))
+
+
+def mark_seen(source, item_id):
+    db("INSERT OR IGNORE INTO seen VALUES (?, ?)", (source, item_id))
+
+
+def meta_get(key):
+    rows = db("SELECT value FROM meta WHERE key=?", (key,))
+    return rows[0][0] if rows else None
+
+
+def meta_set(key, value="1"):
+    db("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+
+
+# --------------------------------------------------------------------------
+# Discord
+# --------------------------------------------------------------------------
+def _discord_request(method, url, payload, params=None):
+    """Send a webhook request, sleeping and retrying on Discord 429s."""
+    for _ in range(5):
+        r = http.request(method, url, json=payload, params=params)
+        if r.status_code == 429:
+            try:
+                wait = float(r.json().get("retry_after", 2))
+            except Exception:
+                wait = 2.0
+            log.warning("Discord rate limited, sleeping %.1fs", wait)
+            time.sleep(wait + 0.5)
+            continue
+        return r
+    raise RuntimeError("Discord rate limit: gave up after 5 attempts")
+
+
+def _content(role_id, text):
+    return f"<@&{role_id}> {text}".strip() if role_id else text
+
+
+def send_discord(embed=None, role_id=None, text=""):
+    """Post a message and return its Discord message ID. The role ping goes in
+    `content` (pings in embeds don't notify), and allowed_mentions whitelists
+    only that role so nothing in a post/video title (@everyone, other roles)
+    can ping anyone. A bare URL in `content` is unfurled by Discord itself."""
+    payload = {
+        "allowed_mentions": {"parse": [], "roles": [role_id] if role_id else []},
+    }
+    if embed:
+        payload["embeds"] = [embed]
+    content = _content(role_id, text)
+    if content:
+        payload["content"] = content
+
+    r = _discord_request("POST", WEBHOOK, payload, params={"wait": "true"})
+    r.raise_for_status()
+    return r.json().get("id")
+
+
+def edit_discord(message_id, embed, role_id, text):
+    """Edit a message this webhook previously posted. Nothing is whitelisted
+    in allowed_mentions, so an edit never pings. Returns False if the message
+    no longer exists (e.g. someone deleted it)."""
+    payload = {
+        "content": _content(role_id, text),
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
+    r = _discord_request("PATCH", f"{WEBHOOK}/messages/{message_id}", payload)
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+    return True
+
+
+# --------------------------------------------------------------------------
+# Bluesky
+# --------------------------------------------------------------------------
+def bsky_poll():
+    r = http.get(
+        BSKY_API,
+        params={"actor": BSKY_ACTOR, "filter": "posts_no_replies", "limit": 30},
+    )
+    r.raise_for_status()
+
+    posts = []
+    for item in r.json().get("feed", []):
+        # Skip reposts. (Pinned posts also carry a `reason`, but of a
+        # different type, so only skip actual reposts.)
+        reason = item.get("reason") or {}
+        if reason.get("$type", "").endswith("reasonRepost"):
+            continue
+        post = item["post"]
+        record = post.get("record", {})
+        if record.get("reply"):
+            continue
+        # Skip quote posts (record and recordWithMedia embeds)
+        if (record.get("embed") or {}).get("$type", "").startswith("app.bsky.embed.record"):
+            continue
+        posts.append(post)
+
+    posts.reverse()  # oldest first
+
+    if not meta_get("bsky_seeded"):
+        for p in posts:
+            mark_seen("bsky", p["uri"])
+        meta_set("bsky_seeded")
+        log.info("Bluesky: seeded %d existing posts (no notifications sent)", len(posts))
+        return
+
+    for post in posts:
+        uri = post["uri"]
+        if is_seen("bsky", uri):
+            continue
+        author = post["author"]
+        name = author.get("displayName") or author["handle"]
+        url = f"https://bsky.app/profile/{author['handle']}/post/{uri.rsplit('/', 1)[-1]}"
+
+        # Plain link in the message body: Discord unfurls it into its own
+        # embed, which keeps links, images and formatting from the post.
+        send_discord(None, BSKY_ROLE_ID, f"{name} just posted on Bluesky!\n{url}")
+        mark_seen("bsky", uri)  # commit only after a successful send
+        log.info("Bluesky: notified %s", url)
+
+
+# --------------------------------------------------------------------------
+# YouTube
+# --------------------------------------------------------------------------
+def yt_get(path, **params):
+    r = http.get(f"{YT_API}/{path}", params={**params, "key": YT_KEY})
+    r.raise_for_status()
+    return r.json()
+
+
+def _parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _discord_time(s):
+    return f"<t:{int(_parse_ts(s).timestamp())}:F>"  # renders in each viewer's timezone
+
+
+def _scheduled_start(video):
+    return (video.get("liveStreamingDetails") or {}).get("scheduledStartTime")
+
+
+def yt_message(video, kind, old_start=None):
+    """Build (embed, text) for kind: video | live | scheduled | rescheduled."""
+    sn = video["snippet"]
+    thumbs = sn.get("thumbnails", {})
+    thumb = (thumbs.get("maxres") or thumbs.get("high") or thumbs.get("default") or {}).get("url")
+    channel = sn.get("channelTitle", "The channel")
+    start = _scheduled_start(video)
+
+    labels = {
+        "video": "New video",
+        "live": "🔴 Live now",
+        "scheduled": "📅 Stream scheduled",
+        "rescheduled": "🕒 Stream rescheduled",
+    }
+    if kind == "video":
+        text = f"{channel} uploaded a new video!"
+    elif kind == "live":
+        text = f"{channel} is live now!"
+    elif kind == "scheduled":
+        text = f"{channel} scheduled a stream" + (f" for {_discord_time(start)}." if start else ".")
+    else:
+        text = f"{channel} rescheduled their stream to {_discord_time(start)}"
+        text += f" (was {_discord_time(old_start)})." if old_start else "."
+
+    embed = {
+        "author": {"name": channel},
+        "title": sn["title"][:256],
+        "url": f"https://www.youtube.com/watch?v={video['id']}",
+        "description": labels[kind],
+        "color": 0xFF0000,
+    }
+    if thumb:
+        embed["image"] = {"url": thumb}
+    return embed, text
+
+
+def yt_notify(video, kind, old_start=None):
+    """Send a YouTube notification (pinging YT_ROLE_ID) and return its message ID."""
+    embed, text = yt_message(video, kind, old_start)
+    msg_id = send_discord(embed, YT_ROLE_ID, text)
+    log.info("YouTube: notified (%s) %s", kind, embed["url"])
+    return msg_id
+
+
+def yt_check_reschedule(video, row):
+    """Compare an upcoming stream's current start time with the one we announced.
+
+    - The new time must hold for two consecutive polls before we act, so a
+      creator fiddling with the time several times doesn't cause noise.
+    - Always: quietly edit the original announcement so it never shows a stale
+      time (edits don't ping).
+    - If the shift is at least YT_RESCHEDULE_THRESHOLD, also post a new
+      pinging "rescheduled" message.
+    """
+    vid, _state, announced, pending, msg_id = row[:5]
+    observed = _scheduled_start(video)
+
+    if not observed:
+        return
+    if announced is None:  # tracked before reschedule support existed: just baseline it
+        db("UPDATE yt_tracked SET scheduled_at=? WHERE video_id=?", (observed, vid))
+        return
+    if observed == announced:
+        if pending:  # time went back to what we announced
+            db("UPDATE yt_tracked SET pending_at=NULL WHERE video_id=?", (vid,))
+        return
+    if observed != pending:  # first sighting of the new time: wait one more poll
+        db("UPDATE yt_tracked SET pending_at=? WHERE video_id=?", (observed, vid))
+        return
+
+    # The new time has held steady: act on it
+    if YT_NOTIFY_SCHEDULED:
+        if msg_id:
+            embed, text = yt_message(video, "scheduled")
+            if not edit_discord(msg_id, embed, YT_ROLE_ID, text + " *(rescheduled)*"):
+                log.warning("YouTube: original message for %s is gone, can't edit", vid)
+        shift = abs((_parse_ts(observed) - _parse_ts(announced)).total_seconds())
+        if shift >= YT_RESCHEDULE_THRESHOLD:
+            yt_notify(video, "rescheduled", old_start=announced)
+        else:
+            log.info("YouTube: small reschedule for %s, edited quietly", vid)
+
+    db("UPDATE yt_tracked SET scheduled_at=?, pending_at=NULL WHERE video_id=?", (observed, vid))
+
+
+def yt_handle_cancelled(row):
+    """A scheduled stream we announced has disappeared (deleted or made private).
+
+    - Quietly edit the original announcement: struck through, marked cancelled.
+    - Post a short follow-up message that does NOT ping the role. Cancellation
+      isn't urgent enough to buzz everyone's phone, but people who planned
+      around the stream should still see it.
+    """
+    vid, _state, announced, _pending, msg_id, title, _missing = row
+    channel = meta_get("yt_channel_name") or "The channel"
+    when = f" for {_discord_time(announced)}" if announced else ""
+
+    embed = {
+        "author": {"name": channel},
+        "title": (title or "Scheduled stream")[:256],
+        "description": "❌ Stream cancelled",
+        "color": 0x808080,
+    }
+    text = f"~~{channel} scheduled a stream{when}.~~ **Cancelled.**"
+    if not edit_discord(msg_id, embed, None, text):
+        log.warning("YouTube: original message for %s is gone, can't edit", vid)
+
+    what = f"scheduled stream **{title[:100]}**" if title else "scheduled stream"
+    send_discord(None, None, f"❌ {channel}'s {what} was cancelled.")
+    log.info("YouTube: notified (cancelled) %s", vid)
+
+
+def yt_poll():
+    uploads = "UU" + YT_CHANNEL_ID[2:]
+    pl = yt_get("playlistItems", part="contentDetails", playlistId=uploads, maxResults=10)
+    playlist_ids = [i["contentDetails"]["videoId"] for i in pl.get("items", [])]
+
+    seeding = not meta_get("yt_seeded")
+    new_ids = [v for v in playlist_ids if not is_seen("yt", v)]
+    tracked = {
+        r[0]: r
+        for r in db(
+            "SELECT video_id, state, scheduled_at, pending_at, message_id, title, missing_polls"
+            " FROM yt_tracked"
+        )
+    }
+
+    # One videos.list call (1 quota unit) covers new IDs and tracked IDs
+    ids = list(dict.fromkeys(new_ids + list(tracked)))
+    videos = {}
+    if ids:
+        data = yt_get("videos", part="snippet,liveStreamingDetails", id=",".join(ids))
+        videos = {v["id"]: v for v in data.get("items", [])}
+
+    # Remember the channel's display name (used when a video is gone and can't be looked up)
+    if videos:
+        name = next(iter(videos.values()))["snippet"].get("channelTitle")
+        if name and name != meta_get("yt_channel_name"):
+            meta_set("yt_channel_name", name)
+
+    # Tracked videos that vanished (deleted/private). For an announced upcoming
+    # stream that means "cancelled", but require it to stay missing for two
+    # consecutive polls so an API hiccup can't trigger a false cancellation.
+    for vid, row in tracked.items():
+        if vid in videos:
+            continue
+        announced = YT_NOTIFY_SCHEDULED and row[1] == "upcoming" and row[4]
+        if not announced:
+            db("DELETE FROM yt_tracked WHERE video_id=?", (vid,))
+        elif (row[6] or 0) + 1 >= 2:
+            yt_handle_cancelled(row)
+            db("DELETE FROM yt_tracked WHERE video_id=?", (vid,))
+        else:
+            db("UPDATE yt_tracked SET missing_polls=missing_polls+1 WHERE video_id=?", (vid,))
+
+    # Newly discovered videos, oldest first
+    for vid in reversed(new_ids):
+        v = videos.get(vid)
+        if not v:
+            continue
+        state = v["snippet"].get("liveBroadcastContent", "none")
+        if state == "none":
+            if not seeding:
+                yt_notify(v, "video")
+        elif state == "live":
+            if not seeding:
+                yt_notify(v, "live")
+            db("INSERT OR REPLACE INTO yt_tracked (video_id, state) VALUES (?, 'live')", (vid,))
+        elif state == "upcoming":
+            msg_id = None
+            if not seeding and YT_NOTIFY_SCHEDULED:
+                msg_id = yt_notify(v, "scheduled")
+            db(
+                "INSERT OR REPLACE INTO yt_tracked (video_id, state, scheduled_at, message_id, title)"
+                " VALUES (?, 'upcoming', ?, ?, ?)",
+                (vid, _scheduled_start(v), msg_id, v["snippet"].get("title")),
+            )
+        mark_seen("yt", vid)
+
+    # Previously tracked upcoming/live videos: look for state changes
+    for vid, row in tracked.items():
+        v = videos.get(vid)
+        if not v:
+            continue
+        old = row[1]
+        state = v["snippet"].get("liveBroadcastContent", "none")
+        if state == "live" and old != "live":
+            yt_notify(v, "live")
+            db("UPDATE yt_tracked SET state='live' WHERE video_id=?", (vid,))
+        elif state == "none":
+            db("DELETE FROM yt_tracked WHERE video_id=?", (vid,))  # ended
+        elif state == "upcoming":
+            start = _scheduled_start(v)
+            if start and _parse_ts(start) < datetime.now(timezone.utc) - timedelta(hours=48):
+                db("DELETE FROM yt_tracked WHERE video_id=?", (vid,))  # stale/never started
+            else:
+                title = v["snippet"].get("title")
+                if title != row[5] or row[6]:
+                    db("UPDATE yt_tracked SET title=?, missing_polls=0 WHERE video_id=?", (title, vid))
+                yt_check_reschedule(v, row)
+
+    if seeding:
+        meta_set("yt_seeded")
+        log.info("YouTube: seeded %d existing videos (no notifications sent)", len(playlist_ids))
+
+
+# --------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------
+def run_forever(name, fn, interval):
+    fails = 0
+    while True:
+        try:
+            fn()
+            if fails:
+                log.info("%s: recovered after %d failure(s)", name, fails)
+            fails = 0
+        except Exception as e:  # one source failing never affects the other
+            fails += 1
+            log.error("%s poll failed (%d in a row): %s", name, fails, e)
+        delay = interval if not fails else min(interval * 2 ** fails, 900)
+        time.sleep(delay * random.uniform(0.9, 1.1))
+
+
+def main():
+    if not WEBHOOK:
+        sys.exit("DISCORD_WEBHOOK_URL is required")
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # clean docker stop
+
+    started = 0
+    if BSKY_ACTOR:
+        threading.Thread(target=run_forever, args=("bluesky", bsky_poll, BSKY_POLL), daemon=True).start()
+        log.info("Watching Bluesky: %s (every %ss)", BSKY_ACTOR, BSKY_POLL)
+        started += 1
+    if YT_KEY and YT_CHANNEL_ID:
+        if not YT_CHANNEL_ID.startswith("UC"):
+            sys.exit("YT_CHANNEL_ID must be a channel ID starting with 'UC'")
+        threading.Thread(target=run_forever, args=("youtube", yt_poll, YT_POLL), daemon=True).start()
+        log.info("Watching YouTube: %s (every %ss)", YT_CHANNEL_ID, YT_POLL)
+        started += 1
+    if not started:
+        sys.exit("Nothing to watch: set BSKY_ACTOR and/or YOUTUBE_API_KEY + YT_CHANNEL_ID")
+
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()

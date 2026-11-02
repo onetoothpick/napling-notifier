@@ -1,0 +1,11 @@
+services:
+  notifier:
+    build: .
+    container_name: discord-notifier
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - notifier-data:/data
+
+volumes:
+  notifier-data:

@@ -1,0 +1,14 @@
+# Secrets and local state
+.env
+state.db
+state.db-*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.DS_Store
