@@ -43,6 +43,8 @@ YT_INCLUDE_MEMBERS = os.environ.get("YT_INCLUDE_MEMBERS", "false").lower() in ("
 YT_RESCHEDULE_THRESHOLD = int(os.environ.get("YT_RESCHEDULE_THRESHOLD_MINUTES") or "60") * 60
 
 DB_PATH = os.environ.get("DB_PATH", "state.db")
+# Log one "still running" line per source this often (0 disables)
+HEARTBEAT = int(os.environ.get("HEARTBEAT_MINUTES") or "60") * 60
 
 BSKY_API = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
 YT_API = "https://www.googleapis.com/youtube/v3"
@@ -63,6 +65,24 @@ def redact(text):
         if secret:
             text = text.replace(secret, "***")
     return text
+
+
+class RedactFilter(logging.Filter):
+    """Safety net: scrub secrets from every log record, including ones emitted by libraries."""
+
+    def filter(self, record):
+        record.msg = redact(record.getMessage())
+        record.args = ()
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RedactFilter())
+
+# httpx logs every request URL at INFO, and our URLs carry the API key / webhook token.
+# We log meaningful events ourselves, so keep the libraries quiet.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 http = httpx.Client(timeout=20, headers={"User-Agent": "discord-notifier/1.0"})
@@ -638,12 +658,21 @@ def yt_poll():
 # --------------------------------------------------------------------------
 def run_forever(name, fn, interval):
     fails = 0
+    polls = 0  # successful polls since the last heartbeat
+    last_beat = time.monotonic()
     while True:
         try:
             fn()
             if fails:
                 log.info("%s: recovered after %d failure(s)", name, fails)
             fails = 0
+            polls += 1
+            # Heartbeat: only logged while healthy; failures are already logged as errors
+            elapsed = time.monotonic() - last_beat
+            if HEARTBEAT and elapsed >= HEARTBEAT:
+                log.info("%s: healthy, %d successful polls in the last %d min", name, polls, round(elapsed / 60))
+                polls = 0
+                last_beat = time.monotonic()
         except Exception as e:  # one source failing never affects the other
             fails += 1
             log.error("%s poll failed (%d in a row): %s", name, fails, redact(e))

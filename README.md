@@ -48,6 +48,7 @@ Everything is configured with environment variables (see `.env.example`). A sour
 | `YT_RESCHEDULE_THRESHOLD_MINUTES` | No          | Reschedules smaller than this only edit the original message; larger ones also post a new pinging message. Default `60`                                        |
 | `DB_PATH`                         | No          | SQLite file location. Default `state.db` (the Docker image uses `/data/state.db`)                                                                              |
 | `LOG_LEVEL`                       | No          | Default `INFO`                                                                                                                                                 |
+| `HEARTBEAT_MINUTES`               | No          | How often each source logs a "healthy" line (see [Logs](#logs)). `0` disables. Default `60`                                                                    |
 
 ## Getting your credentials
 
@@ -108,6 +109,18 @@ This relies on an **undocumented** YouTube playlist, so treat it as best-effort:
 - **Sends are committed after success**, so a Discord outage causes a retry, not a lost notification.
 - **Role pings are locked down:** the ping is in the message text and only the configured role is allowed to be mentioned, so a title containing `@everyone` can't ping anyone.
 - Each source runs independently; one failing never blocks the other, and repeated failures back off up to 15 minutes.
+
+## Logs
+
+Normal operation is quiet. On startup you'll see which sources are being watched, and on the first run a one-time "seeded N existing ..." line per source. After that, a line appears only when something happens (a notification sent, a message edited, a failure). Request URLs are never logged, and the API key and webhook URL are scrubbed from log output.
+
+Once an hour (`HEARTBEAT_MINUTES`), each source logs a heartbeat so you can tell it's alive:
+
+```
+INFO youtube: healthy, 30 successful polls in the last 60 min
+```
+
+The heartbeat is only logged while the source is working. Failures are logged as errors with exponential back-off (up to 15 minutes between attempts), followed by a "recovered" line once it works again. Seeing "seeded" lines again after a redeploy means your state isn't being persisted.
 
 ## Troubleshooting
 
