@@ -1,9 +1,11 @@
-# Napling Notifier
+# Discord Notifier
 
 A small, self-hosted bot that posts to a Discord channel when:
 
 - a **Bluesky** account makes a new post (replies, reposts and quote posts are ignored)
 - a **YouTube** channel uploads a video, goes live, or (optionally) schedules, reschedules or cancels a stream
+
+Announced streams are kept up to date: if the title changes (for example mid-stream) the existing message is updated in place, and when the stream ends the "live now" message is marked as ended.
 
 Each platform can ping its own Discord role, so members only get notified about what they opted into.
 
@@ -29,20 +31,20 @@ Your state lives in a Docker volume, so it survives restarts and updates. To upd
 
 Everything is configured with environment variables (see `.env.example`). A source is enabled only if its variables are set, so you can run Bluesky only, YouTube only, or both.
 
-| Variable                          | Required    | Description                                                                                                             |
-| --------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `DISCORD_WEBHOOK_URL`             | Yes         | Webhook URL for the channel to post in                                                                                  |
-| `BSKY_ACTOR`                      | For Bluesky | Handle (e.g. `someone.bsky.social`) or DID of the account to watch                                                      |
-| `BSKY_ROLE_ID`                    | No          | Role to ping for Bluesky posts                                                                                          |
-| `BSKY_POLL_SECONDS`               | No          | Default `60`                                                                                                            |
-| `YOUTUBE_API_KEY`                 | For YouTube | YouTube Data API v3 key                                                                                                 |
-| `YT_CHANNEL_ID`                   | For YouTube | Channel ID, starting with `UC`                                                                                          |
-| `YT_ROLE_ID`                      | No          | Role to ping for all YouTube notifications                                                                              |
-| `YT_POLL_SECONDS`                 | No          | Default `120`                                                                                                           |
-| `YT_NOTIFY_SCHEDULED`             | No          | `true` to also announce scheduled streams and handle reschedules and cancellations. Default `false`                     |
-| `YT_RESCHEDULE_THRESHOLD_MINUTES` | No          | Reschedules smaller than this only edit the original message; larger ones also post a new pinging message. Default `60` |
-| `DB_PATH`                         | No          | SQLite file location. Default `state.db` (the Docker image uses `/data/state.db`)                                       |
-| `LOG_LEVEL`                       | No          | Default `INFO`                                                                                                          |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_WEBHOOK_URL` | Yes | Webhook URL for the channel to post in |
+| `BSKY_ACTOR` | For Bluesky | Handle (e.g. `someone.bsky.social`) or DID of the account to watch |
+| `BSKY_ROLE_ID` | No | Role to ping for Bluesky posts |
+| `BSKY_POLL_SECONDS` | No | Default `60` |
+| `YOUTUBE_API_KEY` | For YouTube | YouTube Data API v3 key |
+| `YT_CHANNEL_ID` | For YouTube | Channel ID, starting with `UC` |
+| `YT_ROLE_ID` | No | Role to ping for all YouTube notifications |
+| `YT_POLL_SECONDS` | No | Default `120` |
+| `YT_NOTIFY_SCHEDULED` | No | `true` to also announce scheduled streams and handle reschedules and cancellations. Default `false` |
+| `YT_RESCHEDULE_THRESHOLD_MINUTES` | No | Reschedules smaller than this only edit the original message; larger ones also post a new pinging message. Default `60` |
+| `DB_PATH` | No | SQLite file location. Default `state.db` (the Docker image uses `/data/state.db`) |
+| `LOG_LEVEL` | No | Default `INFO` |
 
 ## Getting your credentials
 
@@ -72,6 +74,8 @@ docker run -d --name discord-notifier --restart unless-stopped \
   --env-file .env -v notifier-data:/data discord-notifier
 ```
 
+**Coolify (or similar platforms):** create an application from this repo using the Dockerfile build pack, expose no port, disable the HTTP healthcheck, add the variables from `.env.example`, and add a **persistent storage** mount at `/data`. Without that mount, state is lost on every redeploy and you'll get duplicate notifications.
+
 **Directly with Python** (tested on Python 3.12):
 
 ```bash
@@ -85,24 +89,26 @@ State is saved to `state.db` in the current directory unless you set `DB_PATH`.
 ## How it works
 
 - **Bluesky:** polls the public `getAuthorFeed` endpoint and posts a link for each new top-level post, so Discord builds its own embed (preserving links and images).
-- **YouTube:** polls the channel's uploads playlist and classifies videos with `videos.list` (upload, upcoming or live). With `YT_NOTIFY_SCHEDULED=true`, a rescheduled stream quietly edits the original announcement (and posts a new pinging message if the shift is large), and a cancelled stream is marked cancelled. Changes must hold for two consecutive polls before the bot acts, so a creator fiddling with a schedule doesn't cause noise.
+- **YouTube:** polls the channel's uploads playlist and classifies videos with `videos.list` (upload, upcoming or live). With `YT_NOTIFY_SCHEDULED=true`, a rescheduled stream quietly edits the original announcement (and posts a new pinging message if the shift is large), and a cancelled stream is marked cancelled. If a stream's title changes after it's announced (scheduled or live), the original message is quietly edited to match, without pinging anyone. When a live stream ends, its "live now" message is quietly edited to say the stream ended (with how long it ran, when YouTube provides that), so it never claims a finished stream is live. Changes must hold for two consecutive polls before the bot acts, so a creator fiddling with a schedule or title doesn't cause noise.
 - **Sends are committed after success**, so a Discord outage causes a retry, not a lost notification.
 - **Role pings are locked down:** the ping is in the message text and only the configured role is allowed to be mentioned, so a title containing `@everyone` can't ping anyone.
 - Each source runs independently; one failing never blocks the other, and repeated failures back off up to 15 minutes.
 
 ## Troubleshooting
 
-| Symptom                                  | Likely cause                                                                                                      |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Duplicate notifications after a redeploy | State isn't persisted (no volume mounted at `/data`)                                                              |
-| Role isn't pinged                        | Wrong role ID, or the role isn't mentionable (try enabling "Allow anyone to @mention this role")                  |
-| `403` from YouTube in the logs           | API key missing or restricted incorrectly, API not enabled, or daily quota exhausted (resets at midnight Pacific) |
-| Nothing happens on first start           | Expected. Existing content is recorded silently                                                                   |
+| Symptom | Likely cause |
+|---------|--------------|
+| Duplicate notifications after a redeploy | State isn't persisted (no volume mounted at `/data`) |
+| Role isn't pinged | Wrong role ID, or the role isn't mentionable (try enabling "Allow anyone to @mention this role") |
+| `403` from YouTube in the logs | API key missing or restricted incorrectly, API not enabled, or daily quota exhausted (resets at midnight Pacific) |
+| Nothing happens on first start | Expected. Existing content is recorded silently |
 
 ## Limitations
 
 - Notification latency is bounded by the poll interval, and by how quickly YouTube adds videos to the uploads playlist.
 - YouTube Shorts notify like normal videos.
+- Title updates only apply to streams the bot announced. Thumbnail-only changes aren't detected (the thumbnail's URL doesn't change, and Discord caches embed images by URL); the thumbnail refreshes when the title changes. Normal upload messages are never edited.
+- Only streams the bot announced as live are marked ended. One that was already live when the bot first started, or that was deleted rather than ended, keeps its original message.
 - Bluesky multi-post threads: follow-up posts are self-replies and are excluded by design.
 - A premiere is treated like a scheduled stream, so its messages use the word "stream".
 

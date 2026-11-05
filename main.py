@@ -4,7 +4,7 @@ Discord notifier for one Bluesky account and one YouTube channel.
 
 - Bluesky: new top-level posts only (no replies, reposts, or quote posts)
 - YouTube: new uploads, scheduled streams (optional), streams going live, and
-  reschedules and cancellations of announced streams
+  reschedules, cancellations, title changes and endings of announced streams
 - Pings an optional role per source via a plain Discord webhook
 
 Each source is enabled only if its env vars are set. See .env.example.
@@ -69,7 +69,7 @@ with _lock:
         CREATE TABLE IF NOT EXISTS yt_tracked (
             video_id TEXT PRIMARY KEY, state TEXT NOT NULL,
             scheduled_at TEXT, pending_at TEXT, message_id TEXT,
-            title TEXT, missing_polls INTEGER DEFAULT 0);
+            title TEXT, missing_polls INTEGER DEFAULT 0, pending_title TEXT);
         """
     )
     # Upgrade databases created by earlier versions of this script
@@ -80,6 +80,7 @@ with _lock:
         ("message_id", "TEXT"),
         ("title", "TEXT"),
         ("missing_polls", "INTEGER DEFAULT 0"),
+        ("pending_title", "TEXT"),
     ):
         if _col not in _cols:
             _db.execute(f"ALTER TABLE yt_tracked ADD COLUMN {_col} {_type}")
@@ -240,8 +241,21 @@ def _scheduled_start(video):
     return (video.get("liveStreamingDetails") or {}).get("scheduledStartTime")
 
 
+def _stream_duration(video):
+    """'2h 14m' / '45m' from the stream's actual start and end, or None if unknown."""
+    det = video.get("liveStreamingDetails") or {}
+    try:
+        secs = (_parse_ts(det["actualEndTime"]) - _parse_ts(det["actualStartTime"])).total_seconds()
+    except (KeyError, ValueError):
+        return None
+    hours, minutes = divmod(int(secs) // 60, 60)
+    if not hours and not minutes:
+        return None
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
 def yt_message(video, kind, old_start=None):
-    """Build (embed, text) for kind: video | live | scheduled | rescheduled."""
+    """Build (embed, text) for kind: video | live | ended | scheduled | rescheduled."""
     sn = video["snippet"]
     thumbs = sn.get("thumbnails", {})
     thumb = (thumbs.get("maxres") or thumbs.get("high") or thumbs.get("default") or {}).get("url")
@@ -253,11 +267,14 @@ def yt_message(video, kind, old_start=None):
         "live": "🔴 Live now",
         "scheduled": "📅 Stream scheduled",
         "rescheduled": "🕒 Stream rescheduled",
+        "ended": "⚫ Stream ended",
     }
     if kind == "video":
         text = f"{channel} uploaded a new video!"
     elif kind == "live":
         text = f"{channel} is live now!"
+    elif kind == "ended":
+        text = f"{channel} was live."
     elif kind == "scheduled":
         text = f"{channel} scheduled a stream" + (f" for {_discord_time(start)}." if start else ".")
     else:
@@ -269,8 +286,10 @@ def yt_message(video, kind, old_start=None):
         "title": sn["title"][:256],
         "url": f"https://www.youtube.com/watch?v={video['id']}",
         "description": labels[kind],
-        "color": 0xFF0000,
+        "color": 0x808080 if kind == "ended" else 0xFF0000,
     }
+    if kind == "ended" and _stream_duration(video):
+        embed["description"] += f" · streamed for {_stream_duration(video)}"
     if thumb:
         embed["image"] = {"url": thumb}
     return embed, text
@@ -293,22 +312,24 @@ def yt_check_reschedule(video, row):
       time (edits don't ping).
     - If the shift is at least YT_RESCHEDULE_THRESHOLD, also post a new
       pinging "rescheduled" message.
+
+    Returns True if it acted (so the caller can skip other edits this poll).
     """
     vid, _state, announced, pending, msg_id = row[:5]
     observed = _scheduled_start(video)
 
     if not observed:
-        return
+        return False
     if announced is None:  # tracked before reschedule support existed: just baseline it
         db("UPDATE yt_tracked SET scheduled_at=? WHERE video_id=?", (observed, vid))
-        return
+        return False
     if observed == announced:
         if pending:  # time went back to what we announced
             db("UPDATE yt_tracked SET pending_at=NULL WHERE video_id=?", (vid,))
-        return
+        return False
     if observed != pending:  # first sighting of the new time: wait one more poll
         db("UPDATE yt_tracked SET pending_at=? WHERE video_id=?", (observed, vid))
-        return
+        return False
 
     # The new time has held steady: act on it
     if YT_NOTIFY_SCHEDULED:
@@ -322,7 +343,64 @@ def yt_check_reschedule(video, row):
         else:
             log.info("YouTube: small reschedule for %s, edited quietly", vid)
 
-    db("UPDATE yt_tracked SET scheduled_at=?, pending_at=NULL WHERE video_id=?", (observed, vid))
+    # The edit above rebuilt the whole embed, so the shown title is current too
+    db(
+        "UPDATE yt_tracked SET scheduled_at=?, pending_at=NULL, title=?, pending_title=NULL"
+        " WHERE video_id=?",
+        (observed, video["snippet"].get("title"), vid),
+    )
+    return True
+
+
+def yt_check_title(video, row, kind):
+    """Keep an announcement's title (and thumbnail) current when the creator changes it.
+
+    kind is "live" (the "live now" message) or "scheduled" (the announcement of
+    an upcoming stream). `title` in the database is the title currently shown in
+    our Discord message. A new title must hold for two consecutive polls before
+    we act. We then rebuild the whole embed and edit the message in place; edits
+    never ping, so nobody is re-notified.
+
+    Thumbnail-only changes aren't detected (the thumbnail URL doesn't change,
+    and Discord caches embed images by URL); a thumbnail refreshes whenever the
+    title changes.
+    """
+    vid = row[0]
+    msg_id, shown, pending = row[4], row[5], row[7]
+    observed = video["snippet"].get("title")
+
+    if shown is None:  # row from an older version: just baseline it
+        db("UPDATE yt_tracked SET title=? WHERE video_id=?", (observed, vid))
+        return
+    if observed == shown:
+        if pending:  # title went back to what we showed
+            db("UPDATE yt_tracked SET pending_title=NULL WHERE video_id=?", (vid,))
+        return
+    if observed != pending:  # first sighting of the new title: wait one more poll
+        db("UPDATE yt_tracked SET pending_title=? WHERE video_id=?", (observed, vid))
+        return
+
+    # The new title has held steady: act on it
+    if msg_id and (kind == "live" or YT_NOTIFY_SCHEDULED):
+        embed, text = yt_message(video, kind)
+        if edit_discord(msg_id, embed, YT_ROLE_ID, text):
+            log.info("YouTube: updated %s message for %s (title changed)", kind, vid)
+        else:
+            log.warning("YouTube: message for %s is gone, can't edit", vid)
+    db("UPDATE yt_tracked SET title=?, pending_title=NULL WHERE video_id=?", (observed, vid))
+
+
+def yt_handle_ended(video, row):
+    """A live stream we announced has ended: quietly edit the "live now" message
+    so it no longer claims the stream is live. No new message, no ping."""
+    vid, msg_id = row[0], row[4]
+    if not msg_id:  # not announced by us (e.g. already live when the bot first started)
+        return
+    embed, text = yt_message(video, "ended")
+    if edit_discord(msg_id, embed, None, text):
+        log.info("YouTube: marked stream %s as ended", vid)
+    else:
+        log.warning("YouTube: message for %s is gone, can't mark it ended", vid)
 
 
 def yt_handle_cancelled(row):
@@ -333,7 +411,7 @@ def yt_handle_cancelled(row):
       isn't urgent enough to buzz everyone's phone, but people who planned
       around the stream should still see it.
     """
-    vid, _state, announced, _pending, msg_id, title, _missing = row
+    vid, _state, announced, _pending, msg_id, title, _missing = row[:7]
     channel = meta_get("yt_channel_name") or "The channel"
     when = f" for {_discord_time(announced)}" if announced else ""
 
@@ -362,7 +440,8 @@ def yt_poll():
     tracked = {
         r[0]: r
         for r in db(
-            "SELECT video_id, state, scheduled_at, pending_at, message_id, title, missing_polls"
+            "SELECT video_id, state, scheduled_at, pending_at, message_id, title, missing_polls,"
+            " pending_title"
             " FROM yt_tracked"
         )
     }
@@ -405,9 +484,14 @@ def yt_poll():
             if not seeding:
                 yt_notify(v, "video")
         elif state == "live":
+            msg_id = None
             if not seeding:
-                yt_notify(v, "live")
-            db("INSERT OR REPLACE INTO yt_tracked (video_id, state) VALUES (?, 'live')", (vid,))
+                msg_id = yt_notify(v, "live")
+            db(
+                "INSERT OR REPLACE INTO yt_tracked (video_id, state, message_id, title)"
+                " VALUES (?, 'live', ?, ?)",
+                (vid, msg_id, v["snippet"].get("title")),
+            )
         elif state == "upcoming":
             msg_id = None
             if not seeding and YT_NOTIFY_SCHEDULED:
@@ -427,19 +511,27 @@ def yt_poll():
         old = row[1]
         state = v["snippet"].get("liveBroadcastContent", "none")
         if state == "live" and old != "live":
-            yt_notify(v, "live")
-            db("UPDATE yt_tracked SET state='live' WHERE video_id=?", (vid,))
+            msg_id = yt_notify(v, "live")
+            db(
+                "UPDATE yt_tracked SET state='live', message_id=?, title=?, pending_at=NULL,"
+                " pending_title=NULL, missing_polls=0 WHERE video_id=?",
+                (msg_id, v["snippet"].get("title"), vid),
+            )
+        elif state == "live":
+            yt_check_title(v, row, "live")
         elif state == "none":
+            if old == "live":
+                yt_handle_ended(v, row)
             db("DELETE FROM yt_tracked WHERE video_id=?", (vid,))  # ended
         elif state == "upcoming":
             start = _scheduled_start(v)
             if start and _parse_ts(start) < datetime.now(timezone.utc) - timedelta(hours=48):
                 db("DELETE FROM yt_tracked WHERE video_id=?", (vid,))  # stale/never started
             else:
-                title = v["snippet"].get("title")
-                if title != row[5] or row[6]:
-                    db("UPDATE yt_tracked SET title=?, missing_polls=0 WHERE video_id=?", (title, vid))
-                yt_check_reschedule(v, row)
+                if row[6]:
+                    db("UPDATE yt_tracked SET missing_polls=0 WHERE video_id=?", (vid,))
+                if not yt_check_reschedule(v, row):
+                    yt_check_title(v, row, "scheduled")
 
     if seeding:
         meta_set("yt_seeded")
