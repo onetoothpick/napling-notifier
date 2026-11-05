@@ -5,6 +5,7 @@ Discord notifier for one Bluesky account and one YouTube channel.
 - Bluesky: new top-level posts only (no replies, reposts, or quote posts)
 - YouTube: new uploads, scheduled streams (optional), streams going live, and
   reschedules, cancellations, title changes and endings of announced streams
+  (optionally including members-only streams)
 - Pings an optional role per source via a plain Discord webhook
 
 Each source is enabled only if its env vars are set. See .env.example.
@@ -35,6 +36,8 @@ YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID")  # starts with UC
 YT_ROLE_ID = os.environ.get("YT_ROLE_ID") or None
 YT_POLL = int(os.environ.get("YT_POLL_SECONDS") or "120")
 YT_NOTIFY_SCHEDULED = os.environ.get("YT_NOTIFY_SCHEDULED", "false").lower() in ("1", "true", "yes")
+# Also watch the channel's members-only live streams (needs one extra API call per poll)
+YT_INCLUDE_MEMBERS = os.environ.get("YT_INCLUDE_MEMBERS", "false").lower() in ("1", "true", "yes")
 # Reschedules smaller than this edit the original message quietly; larger ones
 # also post a new (pinging) message.
 YT_RESCHEDULE_THRESHOLD = int(os.environ.get("YT_RESCHEDULE_THRESHOLD_MINUTES") or "60") * 60
@@ -50,6 +53,17 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("notifier")
+
+
+def redact(text):
+    """Strip secrets from text before logging. HTTP error messages include the
+    full request URL, which contains the YouTube API key or the webhook token."""
+    text = str(text)
+    for secret in (YT_KEY, WEBHOOK):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
 
 http = httpx.Client(timeout=20, headers={"User-Agent": "discord-notifier/1.0"})
 
@@ -69,7 +83,8 @@ with _lock:
         CREATE TABLE IF NOT EXISTS yt_tracked (
             video_id TEXT PRIMARY KEY, state TEXT NOT NULL,
             scheduled_at TEXT, pending_at TEXT, message_id TEXT,
-            title TEXT, missing_polls INTEGER DEFAULT 0, pending_title TEXT);
+            title TEXT, missing_polls INTEGER DEFAULT 0, pending_title TEXT,
+            members INTEGER DEFAULT 0);
         """
     )
     # Upgrade databases created by earlier versions of this script
@@ -81,6 +96,7 @@ with _lock:
         ("title", "TEXT"),
         ("missing_polls", "INTEGER DEFAULT 0"),
         ("pending_title", "TEXT"),
+        ("members", "INTEGER DEFAULT 0"),
     ):
         if _col not in _cols:
             _db.execute(f"ALTER TABLE yt_tracked ADD COLUMN {_col} {_type}")
@@ -254,8 +270,16 @@ def _stream_duration(video):
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def yt_message(video, kind, old_start=None):
-    """Build (embed, text) for kind: video | live | ended | scheduled | rescheduled."""
+def _is_members(video_id):
+    rows = db("SELECT members FROM yt_tracked WHERE video_id=?", (video_id,))
+    return bool(rows and rows[0][0])
+
+
+def yt_message(video, kind, old_start=None, members=None):
+    """Build (embed, text) for kind: video | live | ended | scheduled | rescheduled.
+    `members` marks it members-only; if None, it's looked up from the tracked row."""
+    if members is None:
+        members = _is_members(video["id"])
     sn = video["snippet"]
     thumbs = sn.get("thumbnails", {})
     thumb = (thumbs.get("maxres") or thumbs.get("high") or thumbs.get("default") or {}).get("url")
@@ -292,12 +316,15 @@ def yt_message(video, kind, old_start=None):
         embed["description"] += f" · streamed for {_stream_duration(video)}"
     if thumb:
         embed["image"] = {"url": thumb}
+    if members:
+        text = f"🔒 Members-only: {text}"
+        embed["description"] = f"🔒 Members-only · {embed['description']}"
     return embed, text
 
 
-def yt_notify(video, kind, old_start=None):
+def yt_notify(video, kind, old_start=None, members=None):
     """Send a YouTube notification (pinging YT_ROLE_ID) and return its message ID."""
-    embed, text = yt_message(video, kind, old_start)
+    embed, text = yt_message(video, kind, old_start, members)
     msg_id = send_discord(embed, YT_ROLE_ID, text)
     log.info("YouTube: notified (%s) %s", kind, embed["url"])
     return msg_id
@@ -422,6 +449,9 @@ def yt_handle_cancelled(row):
         "color": 0x808080,
     }
     text = f"~~{channel} scheduled a stream{when}.~~ **Cancelled.**"
+    if row[8]:
+        embed["description"] = "🔒 Members-only · " + embed["description"]
+        text = "🔒 Members-only: " + text
     if not edit_discord(msg_id, embed, None, text):
         log.warning("YouTube: original message for %s is gone, can't edit", vid)
 
@@ -430,18 +460,76 @@ def yt_handle_cancelled(row):
     log.info("YouTube: notified (cancelled) %s", vid)
 
 
+QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
+_members_retry_at = 0.0  # monotonic time before which we don't ask for the members playlist
+
+
+def _error_reason(response):
+    try:
+        return response.json()["error"]["errors"][0]["reason"]
+    except Exception:
+        return None
+
+
+def yt_members_ids():
+    """Video IDs from the channel's members-only live streams playlist ("UUMV...").
+
+    This is an undocumented playlist, so it must never break the main poll:
+    returns None if it can't be read right now. A "not found"/"forbidden" answer
+    (e.g. the channel has no memberships) is retried only once an hour, so it
+    doesn't waste a quota unit on every poll.
+    """
+    global _members_retry_at
+    if time.monotonic() < _members_retry_at:
+        return None
+    try:
+        data = yt_get(
+            "playlistItems",
+            part="contentDetails",
+            playlistId="UUMV" + YT_CHANNEL_ID[2:],
+            maxResults=10,
+        )
+    except httpx.HTTPStatusError as e:
+        status, reason = e.response.status_code, _error_reason(e.response)
+        if status in (403, 404) and reason not in QUOTA_REASONS:
+            _members_retry_at = time.monotonic() + 3600
+            log.info(
+                "YouTube: members-only playlist unavailable (HTTP %s, %s); checking again in an hour",
+                status,
+                reason,
+            )
+        else:
+            log.warning("YouTube: members-only playlist check failed: %s", redact(e))
+        return None
+    except Exception as e:
+        log.warning("YouTube: members-only playlist check failed: %s", redact(e))
+        return None
+    return [i["contentDetails"]["videoId"] for i in data.get("items", [])]
+
+
 def yt_poll():
     uploads = "UU" + YT_CHANNEL_ID[2:]
     pl = yt_get("playlistItems", part="contentDetails", playlistId=uploads, maxResults=10)
     playlist_ids = [i["contentDetails"]["videoId"] for i in pl.get("items", [])]
 
+    # Optional members-only streams. Seeded separately from the main playlist, so
+    # turning the feature on later doesn't announce the existing backlog.
+    member_ids = yt_members_ids() if YT_INCLUDE_MEMBERS else None
+    members_seeding = member_ids is not None and not meta_get("yt_members_seeded")
+    members_set = set(member_ids or [])
+
     seeding = not meta_get("yt_seeded")
-    new_ids = [v for v in playlist_ids if not is_seen("yt", v)]
+    seed_ids = set(playlist_ids) if seeding else set()
+    if members_seeding:
+        seed_ids |= members_set
+
+    candidates = list(dict.fromkeys(playlist_ids + (member_ids or [])))
+    new_ids = [v for v in candidates if not is_seen("yt", v)]
     tracked = {
         r[0]: r
         for r in db(
             "SELECT video_id, state, scheduled_at, pending_at, message_id, title, missing_polls,"
-            " pending_title"
+            " pending_title, members"
             " FROM yt_tracked"
         )
     }
@@ -479,27 +567,31 @@ def yt_poll():
         v = videos.get(vid)
         if not v:
             continue
+        quiet = vid in seed_ids  # first-run backlog: record, don't announce
+        members = vid in members_set
         state = v["snippet"].get("liveBroadcastContent", "none")
         if state == "none":
-            if not seeding:
-                yt_notify(v, "video")
+            # A members-only stream that already ended isn't worth announcing
+            if not quiet and not members:
+                yt_notify(v, "video", members=False)
         elif state == "live":
             msg_id = None
-            if not seeding:
-                msg_id = yt_notify(v, "live")
+            if not quiet:
+                msg_id = yt_notify(v, "live", members=members)
             db(
-                "INSERT OR REPLACE INTO yt_tracked (video_id, state, message_id, title)"
-                " VALUES (?, 'live', ?, ?)",
-                (vid, msg_id, v["snippet"].get("title")),
+                "INSERT OR REPLACE INTO yt_tracked (video_id, state, message_id, title, members)"
+                " VALUES (?, 'live', ?, ?, ?)",
+                (vid, msg_id, v["snippet"].get("title"), int(members)),
             )
         elif state == "upcoming":
             msg_id = None
-            if not seeding and YT_NOTIFY_SCHEDULED:
-                msg_id = yt_notify(v, "scheduled")
+            if not quiet and YT_NOTIFY_SCHEDULED:
+                msg_id = yt_notify(v, "scheduled", members=members)
             db(
-                "INSERT OR REPLACE INTO yt_tracked (video_id, state, scheduled_at, message_id, title)"
-                " VALUES (?, 'upcoming', ?, ?, ?)",
-                (vid, _scheduled_start(v), msg_id, v["snippet"].get("title")),
+                "INSERT OR REPLACE INTO yt_tracked"
+                " (video_id, state, scheduled_at, message_id, title, members)"
+                " VALUES (?, 'upcoming', ?, ?, ?, ?)",
+                (vid, _scheduled_start(v), msg_id, v["snippet"].get("title"), int(members)),
             )
         mark_seen("yt", vid)
 
@@ -536,6 +628,9 @@ def yt_poll():
     if seeding:
         meta_set("yt_seeded")
         log.info("YouTube: seeded %d existing videos (no notifications sent)", len(playlist_ids))
+    if members_seeding:
+        meta_set("yt_members_seeded")
+        log.info("YouTube: seeded %d members-only streams (no notifications sent)", len(member_ids))
 
 
 # --------------------------------------------------------------------------
@@ -551,7 +646,7 @@ def run_forever(name, fn, interval):
             fails = 0
         except Exception as e:  # one source failing never affects the other
             fails += 1
-            log.error("%s poll failed (%d in a row): %s", name, fails, e)
+            log.error("%s poll failed (%d in a row): %s", name, fails, redact(e))
         delay = interval if not fails else min(interval * 2 ** fails, 900)
         time.sleep(delay * random.uniform(0.9, 1.1))
 
