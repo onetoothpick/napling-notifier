@@ -33,22 +33,22 @@ Your state lives in a Docker volume, so it survives restarts and updates. To upd
 
 Everything is configured with environment variables (see `.env.example`). A source is enabled only if its variables are set, so you can run Bluesky only, YouTube only, or both.
 
-| Variable                          | Required    | Description                                                                                                                                                    |
-| --------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DISCORD_WEBHOOK_URL`             | Yes         | Webhook URL for the channel to post in                                                                                                                         |
-| `BSKY_ACTOR`                      | For Bluesky | Handle (e.g. `someone.bsky.social`) or DID of the account to watch                                                                                             |
-| `BSKY_ROLE_ID`                    | No          | Role to ping for Bluesky posts                                                                                                                                 |
-| `BSKY_POLL_SECONDS`               | No          | Default `60`                                                                                                                                                   |
-| `YOUTUBE_API_KEY`                 | For YouTube | YouTube Data API v3 key                                                                                                                                        |
-| `YT_CHANNEL_ID`                   | For YouTube | Channel ID, starting with `UC`                                                                                                                                 |
-| `YT_ROLE_ID`                      | No          | Role to ping for all YouTube notifications                                                                                                                     |
-| `YT_POLL_SECONDS`                 | No          | Default `120`                                                                                                                                                  |
-| `YT_NOTIFY_SCHEDULED`             | No          | `true` to also announce scheduled streams and handle reschedules and cancellations. Default `false`                                                            |
-| `YT_INCLUDE_MEMBERS`              | No          | `true` to also watch the channel's members-only live streams (one extra API call per poll). Default `false`. See [Members-only streams](#members-only-streams) |
-| `YT_RESCHEDULE_THRESHOLD_MINUTES` | No          | Reschedules smaller than this only edit the original message; larger ones also post a new pinging message. Default `60`                                        |
-| `DB_PATH`                         | No          | SQLite file location. Default `state.db` (the Docker image uses `/data/state.db`)                                                                              |
-| `LOG_LEVEL`                       | No          | Default `INFO`                                                                                                                                                 |
-| `HEARTBEAT_MINUTES`               | No          | How often each source logs a "healthy" line (see [Logs](#logs)). `0` disables. Default `60`                                                                    |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_WEBHOOK_URL` | Yes | Webhook URL for the channel to post in |
+| `BSKY_ACTOR` | For Bluesky | Handle (e.g. `someone.bsky.social`) or DID of the account to watch |
+| `BSKY_ROLE_ID` | No | Role to ping for Bluesky posts |
+| `BSKY_POLL_SECONDS` | No | Default `60` |
+| `YOUTUBE_API_KEY` | For YouTube | YouTube Data API v3 key |
+| `YT_CHANNEL_ID` | For YouTube | Channel ID, starting with `UC` |
+| `YT_ROLE_ID` | No | Role to ping for all YouTube notifications |
+| `YT_POLL_SECONDS` | No | Default `120` |
+| `YT_NOTIFY_SCHEDULED` | No | `true` to also announce scheduled streams and handle reschedules and cancellations. Default `false` |
+| `YT_INCLUDE_MEMBERS` | No | `true` to also watch the channel's members-only live streams (one extra API call per poll). Default `false`. See [Members-only streams](#members-only-streams) |
+| `YT_RESCHEDULE_THRESHOLD_MINUTES` | No | Reschedules smaller than this only edit the original message; larger ones also post a new pinging message. Default `60` |
+| `DB_PATH` | No | SQLite file location. Default `state.db` (the Docker image uses `/data/state.db`) |
+| `LOG_LEVEL` | No | Default `INFO` |
+| `HEARTBEAT_MINUTES` | No | How often each source logs a "healthy" line (see [Logs](#logs)). `0` disables. Default `60` |
 
 ## Getting your credentials
 
@@ -92,7 +92,7 @@ State is saved to `state.db` in the current directory unless you set `DB_PATH`.
 
 ## Members-only streams
 
-Members-only content isn't in a channel's public uploads playlist, so by default the bot never sees it. Setting `YT_INCLUDE_MEMBERS=true` makes it also read the channel's members-only live streams playlist, which gets the same scheduled, live, rescheduled, retitled, cancelled and ended handling as public streams, labeled "🔒 Members-only".
+Members-only content isn't in a channel's public uploads playlist, so by default the bot never sees it. Setting `YT_INCLUDE_MEMBERS=true` makes it also read the channel's members-only live streams playlist, which gets the same scheduled, live, rescheduled, retitled, cancelled and ended handling as public streams, labeled "🔒 Members Only" in the message text.
 
 This relies on an **undocumented** YouTube playlist, so treat it as best-effort:
 
@@ -124,13 +124,13 @@ The heartbeat is only logged while the source is working. Failures are logged as
 
 ## Troubleshooting
 
-| Symptom                                  | Likely cause                                                                                                                      |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Duplicate notifications after a redeploy | State isn't persisted (no volume mounted at `/data`)                                                                              |
-| Role isn't pinged                        | Wrong role ID, or the role isn't mentionable (try enabling "Allow anyone to @mention this role")                                  |
-| `403` from YouTube in the logs           | API key missing or restricted incorrectly, API not enabled, or daily quota exhausted (resets at midnight Pacific)                 |
-| Members-only streams aren't announced    | `YT_INCLUDE_MEMBERS` must be `true`. Check the logs for "members-only playlist unavailable", which means the API couldn't read it |
-| Nothing happens on first start           | Expected. Existing content is recorded silently                                                                                   |
+| Symptom | Likely cause |
+|---------|--------------|
+| Duplicate notifications after a redeploy | State isn't persisted (no volume mounted at `/data`) |
+| Role isn't pinged | Wrong role ID, or the role isn't mentionable (try enabling "Allow anyone to @mention this role") |
+| `403` from YouTube in the logs | API key missing or restricted incorrectly, API not enabled, or daily quota exhausted (resets at midnight Pacific) |
+| Members-only streams aren't announced | `YT_INCLUDE_MEMBERS` must be `true`. Check the logs for "members-only playlist unavailable", which means the API couldn't read it |
+| Nothing happens on first start | Expected. Existing content is recorded silently |
 
 ## Limitations
 

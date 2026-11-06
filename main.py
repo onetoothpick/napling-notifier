@@ -337,8 +337,7 @@ def yt_message(video, kind, old_start=None, members=None):
     if thumb:
         embed["image"] = {"url": thumb}
     if members:
-        text = f"🔒 Members-only: {text}"
-        embed["description"] = f"🔒 Members-only · {embed['description']}"
+        text = f"🔒 Members Only: {text}"
     return embed, text
 
 
@@ -470,8 +469,7 @@ def yt_handle_cancelled(row):
     }
     text = f"~~{channel} scheduled a stream{when}.~~ **Cancelled.**"
     if row[8]:
-        embed["description"] = "🔒 Members-only · " + embed["description"]
-        text = "🔒 Members-only: " + text
+        text = "🔒 Members Only: " + text
     if not edit_discord(msg_id, embed, None, text):
         log.warning("YouTube: original message for %s is gone, can't edit", vid)
 
